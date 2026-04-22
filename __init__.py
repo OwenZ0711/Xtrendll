@@ -12,7 +12,11 @@ folder are modified.
 """
 
 from .lag_blocks import LagAwarePeerBlock
-from .x_trend_ll import XTrendLL, LL_DEFAULT, _xtrendll_step, _xtrendll_step_panel
+from .x_trend_ll import (
+    XTrendLL, LL_DEFAULT,
+    _xtrendll_step, _xtrendll_step_panel,
+    make_xtrendll_step, make_xtrendll_step_panel,
+)
 from .lead_lag import build_lead_lag_matrix, build_lead_lag_matrix_cached
 from .prep_artifacts import load_artifacts
 from .results_io import save_run, load_run, compare_runs
@@ -23,6 +27,8 @@ __all__ = [
     "LL_DEFAULT",
     "_xtrendll_step",
     "_xtrendll_step_panel",
+    "make_xtrendll_step",
+    "make_xtrendll_step_panel",
     "build_lead_lag_matrix",
     "build_lead_lag_matrix_cached",
     "load_artifacts",
