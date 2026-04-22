@@ -18,7 +18,7 @@ git add .
 git commit -m "Initial commit: xtrendll self-contained fork"
 
 # create an empty repo on GitHub named "xtrendll" (or whatever you prefer)
-git remote add origin https://github.com/<YOUR-USERNAME>/xtrendll.git
+git remote add origin https://github.com/OwenZ0711/Xtrendll.git
 git branch -M main
 git push -u origin main
 ```
@@ -51,7 +51,7 @@ xtrendll/
 Before you push (or right after), **edit the clone cell** of the two training notebooks — `xtrendll_a1_no_bennett.ipynb` cell 2 and `xtrendll_a2_with_bennett.ipynb` cell 2 — and replace
 
 ```python
-XTRENDLL_REPO = 'https://github.com/YOUR-USERNAME/xtrendll.git'
+XTRENDLL_REPO = 'https://github.com/OwenZ0711/xtrendll.git'
 ```
 
 with your actual fork URL. Commit and push.
@@ -59,7 +59,7 @@ with your actual fork URL. Commit and push.
 If your repo is **private**, make Colab clone it via a personal access token:
 
 ```python
-XTRENDLL_REPO = 'https://<token>@github.com/<you>/xtrendll.git'
+XTRENDLL_REPO = 'https://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@github.com/OwenZ0711/xtrendll.git'
 ```
 
 ---
