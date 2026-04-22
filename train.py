@@ -12,8 +12,25 @@ from .config import TRAIN, MODEL
 # Loss
 # ═══════════════════════════════════════════════════════════════════════════════
 def sharpe_loss_tc(pos: torch.Tensor, ret: torch.Tensor,
-                warmup: int = 63, cost_bps: float = 0.0, eps: float = 1e-9) -> torch.Tensor:
-    """Negative annualised Sharpe with warm-up masking."""
+                warmup: int = 63, cost_bps: float = 0.0,
+                lambda_ret: float = 0.0, eps: float = 1e-9) -> torch.Tensor:
+    """
+    Negative annualised Sharpe with warm-up masking, optionally augmented
+    with a level-sensitive return term.
+
+        loss = -Sharpe_net  -  lambda_ret * (252 * mean(net))
+
+    The Sharpe component is scale-invariant in position magnitude: multiplying
+    every position by any k > 0 leaves it unchanged, so gradient descent has
+    no reason to push |pos| toward any particular value.  The extra term is
+    linear in |pos| (via mean(net)), which breaks the invariance and gives
+    the model an incentive to engage the tanh-bounded positions wherever it
+    has directional signal, and to stay near zero where it does not.
+
+    lambda_ret = 0.0 reproduces the original pure-Sharpe loss.  Typical
+    working values are 0.5 to 3.0; start at 1.0 and halve / double based on
+    observed turnover and position magnitude.
+    """
     if warmup > 0:
         pos, ret = pos[:, warmup:], ret[:, warmup:]
     raw = pos * ret
@@ -21,7 +38,10 @@ def sharpe_loss_tc(pos: torch.Tensor, ret: torch.Tensor,
     net = raw - (cost_bps / 10_000) * turnover
     mu = net.mean()
     var = (net.pow(2).mean() - mu.pow(2)).clamp_min(eps)
-    return -math.sqrt(252.0) * mu / var.sqrt()
+    loss = -math.sqrt(252.0) * mu / var.sqrt()
+    if lambda_ret != 0.0:
+        loss = loss - lambda_ret * 252.0 * mu
+    return loss
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Performance Metrics

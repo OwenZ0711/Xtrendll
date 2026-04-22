@@ -130,61 +130,94 @@ class XTrendLL(XTrendCS):
 # Training step functions — thin wrappers that pull batch fields and run
 # the model.  Mirror `_xtrend_cs_step` / `_xtrend_cs_step_panel` in train.py;
 # lives here so notebooks import from xtrendll without any train.py edit.
+#
+# Two flavours are exposed:
+#   * `_xtrendll_step` / `_xtrendll_step_panel` — backward-compat pure-Sharpe
+#     step functions (lambda_ret = 0), so existing notebooks keep working.
+#   * `make_xtrendll_step(...)` / `make_xtrendll_step_panel(...)` — factories
+#     that return a step function with a non-zero `lambda_ret` baked in.
+#     Use these when you want to add the net-annualised-return term to the
+#     Sharpe loss (see sharpe_loss_tc docstring).
 # ────────────────────────────────────────────────────────────────────────────
-def _xtrendll_step(model, batch, device, warmup, cost_bps=None):
-    if cost_bps is None:
-        cost_bps = TRAIN["cost_bps"]
-    target_x  = batch["target_x"].to(device)
-    target_y  = batch["target_y"].to(device)
-    target_id = batch["target_id"].to(device)
-    ctx_x     = batch["ctx_x"].to(device)
-    ctx_y     = batch["ctx_y"].to(device)
-    ctx_id    = batch["ctx_id"].to(device)
-    peer_x    = batch["peer_x"].to(device)
-    peer_id   = batch["peer_id"].to(device)
-    peer_mask = batch["peer_mask"].to(device)
-
-    pos = model(
-        target_x, target_id, ctx_x, ctx_y, ctx_id,
-        peer_x, peer_id, peer_mask,
-    )
-    loss = sharpe_loss_tc(pos, target_y, warmup, cost_bps=cost_bps)
-    return loss, pos, target_y, batch["date"], batch["ticker"]
-
-
-def _xtrendll_step_panel(model, batch, device, warmup, cost_bps=None,
-                         endpoint_weight=0.5, mag_reg=0.0):
+def make_xtrendll_step(lambda_ret: float = 0.0):
     """
-    Panel-endpoint variant. Mirrors `_xtrend_cs_step_panel` for notebooks
-    that use `ConsecutiveDatePanelBatchSampler` + endpoint-Sharpe loss.
+    Factory returning a step function compatible with train.fit /
+    train.train_epoch.  `lambda_ret` is captured by closure and forwarded
+    to `sharpe_loss_tc` on every batch.
+
+        step_fn = make_xtrendll_step(lambda_ret=1.0)
+        fit(model, ..., step_fn, TRAIN_RUN, MODEL_RUN)
     """
-    # Local import for the panel helpers so the top-level module remains
-    # safe to import in environments where only the basic training step
-    # is used.
-    from .train import panel_endpoint_sharpe_loss, _reshape_panel_endpoints
+    def _step(model, batch, device, warmup, cost_bps=None):
+        if cost_bps is None:
+            cost_bps = TRAIN["cost_bps"]
+        target_x  = batch["target_x"].to(device)
+        target_y  = batch["target_y"].to(device)
+        target_id = batch["target_id"].to(device)
+        ctx_x     = batch["ctx_x"].to(device)
+        ctx_y     = batch["ctx_y"].to(device)
+        ctx_id    = batch["ctx_id"].to(device)
+        peer_x    = batch["peer_x"].to(device)
+        peer_id   = batch["peer_id"].to(device)
+        peer_mask = batch["peer_mask"].to(device)
 
-    if cost_bps is None:
-        cost_bps = TRAIN["cost_bps"]
-    target_x  = batch["target_x"].to(device)
-    target_y  = batch["target_y"].to(device)
-    target_id = batch["target_id"].to(device)
-    ctx_x     = batch["ctx_x"].to(device)
-    ctx_y     = batch["ctx_y"].to(device)
-    ctx_id    = batch["ctx_id"].to(device)
-    peer_x    = batch["peer_x"].to(device)
-    peer_id   = batch["peer_id"].to(device)
-    peer_mask = batch["peer_mask"].to(device)
+        pos = model(
+            target_x, target_id, ctx_x, ctx_y, ctx_id,
+            peer_x, peer_id, peer_mask,
+        )
+        loss = sharpe_loss_tc(
+            pos, target_y, warmup,
+            cost_bps=cost_bps, lambda_ret=lambda_ret,
+        )
+        return loss, pos, target_y, batch["date"], batch["ticker"]
+    return _step
 
-    pos = model(
-        target_x, target_id, ctx_x, ctx_y, ctx_id,
-        peer_x, peer_id, peer_mask,
-    )
-    intra_loss = sharpe_loss_tc(pos, target_y, warmup, cost_bps=cost_bps)
-    pos_panel, ret_panel = _reshape_panel_endpoints(
-        pos[:, -1], target_y[:, -1], batch["date"], batch["ticker"]
-    )
-    end_loss = panel_endpoint_sharpe_loss(pos_panel, ret_panel, cost_bps)
-    loss = (1.0 - endpoint_weight) * intra_loss + endpoint_weight * end_loss
-    if mag_reg > 0.0:
-        loss = loss + mag_reg * (pos.pow(2).mean() - 0.25).clamp_min(0.0)
-    return loss, pos, target_y, batch["date"], batch["ticker"]
+
+def make_xtrendll_step_panel(lambda_ret: float = 0.0,
+                             endpoint_weight: float = 0.5,
+                             mag_reg: float = 0.0):
+    """
+    Factory returning a panel-endpoint step function (same contract as
+    `_xtrend_cs_step_panel`).  `lambda_ret` is forwarded to the intra-window
+    Sharpe loss.
+    """
+    def _step(model, batch, device, warmup, cost_bps=None):
+        # Local import for the panel helpers so the top-level module remains
+        # safe to import in environments where only the basic training step
+        # is used.
+        from .train import panel_endpoint_sharpe_loss, _reshape_panel_endpoints
+
+        if cost_bps is None:
+            cost_bps = TRAIN["cost_bps"]
+        target_x  = batch["target_x"].to(device)
+        target_y  = batch["target_y"].to(device)
+        target_id = batch["target_id"].to(device)
+        ctx_x     = batch["ctx_x"].to(device)
+        ctx_y     = batch["ctx_y"].to(device)
+        ctx_id    = batch["ctx_id"].to(device)
+        peer_x    = batch["peer_x"].to(device)
+        peer_id   = batch["peer_id"].to(device)
+        peer_mask = batch["peer_mask"].to(device)
+
+        pos = model(
+            target_x, target_id, ctx_x, ctx_y, ctx_id,
+            peer_x, peer_id, peer_mask,
+        )
+        intra_loss = sharpe_loss_tc(
+            pos, target_y, warmup,
+            cost_bps=cost_bps, lambda_ret=lambda_ret,
+        )
+        pos_panel, ret_panel = _reshape_panel_endpoints(
+            pos[:, -1], target_y[:, -1], batch["date"], batch["ticker"]
+        )
+        end_loss = panel_endpoint_sharpe_loss(pos_panel, ret_panel, cost_bps)
+        loss = (1.0 - endpoint_weight) * intra_loss + endpoint_weight * end_loss
+        if mag_reg > 0.0:
+            loss = loss + mag_reg * (pos.pow(2).mean() - 0.25).clamp_min(0.0)
+        return loss, pos, target_y, batch["date"], batch["ticker"]
+    return _step
+
+
+# Backward-compat defaults (pure Sharpe, lambda_ret = 0).
+_xtrendll_step       = make_xtrendll_step(lambda_ret=0.0)
+_xtrendll_step_panel = make_xtrendll_step_panel(lambda_ret=0.0)
