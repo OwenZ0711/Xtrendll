@@ -17,7 +17,11 @@ from .x_trend_ll import (
     _xtrendll_step, _xtrendll_step_panel,
     make_xtrendll_step, make_xtrendll_step_panel,
 )
-from .lead_lag import build_lead_lag_matrix, build_lead_lag_matrix_cached
+from .lead_lag import (
+    build_lead_lag_matrix, build_lead_lag_matrix_cached, align_S_to_asset_ids,
+    build_lag_ranking_artifact, build_lag_ranking_cached,
+    artifact_to_lag_strength_tensor, artifact_to_lag_topk_mask_tensor,
+)
 from .prep_artifacts import load_artifacts
 from .results_io import save_run, load_run, compare_runs
 
@@ -31,6 +35,11 @@ __all__ = [
     "make_xtrendll_step_panel",
     "build_lead_lag_matrix",
     "build_lead_lag_matrix_cached",
+    "align_S_to_asset_ids",
+    "build_lag_ranking_artifact",
+    "build_lag_ranking_cached",
+    "artifact_to_lag_strength_tensor",
+    "artifact_to_lag_topk_mask_tensor",
     "load_artifacts",
     "save_run",
     "load_run",

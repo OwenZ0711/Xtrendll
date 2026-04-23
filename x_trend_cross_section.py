@@ -11,11 +11,15 @@ class XTrendCS(XTrend):
     Two refinements vs. the original design, both motivated by the
     observation that `XTrendCS` tended to under-return vs. pure `XTrend`:
 
-    (a) `reg_proj` is now **identity-initialised** so that at epoch 0 the
-        regime branch passes through the fusion LayerNorm untouched
-        (enc_y ≈ reg_y at init, exactly matching pure XTrend).  This
-        prevents the first several epochs from being wasted learning a
-        near-identity on reg_y from a random projection.
+    (a) **Gated residual fusion.**  The regime branch flows through the
+        fusion step unmodified (`enc_y = reg_y + g ⊙ cs_proj(cs_y)`).
+        `cs_proj` is zero-initialised and the gate bias is set to −2.0,
+        so at step 0 the cross-section contribution is exactly zero and
+        `enc_y == reg_y` — i.e. `XTrendCS` starts as vanilla `XTrend` and
+        the peer branch can only be opened by gradient descent when it
+        helps.  A content-aware sigmoid gate over `[reg_y, cs_y]` lets
+        the model decide per-timestep how much of the peer signal to let
+        in.  No second LayerNorm on `reg_y`.
 
     (b) Peers get their **own** TemporalBlock encoder (`peer_encoder`)
         rather than sharing `query_encoder` with the target branch.
@@ -29,28 +33,45 @@ class XTrendCS(XTrend):
         super().__init__(input_dim, num_assets, cfg)
         hid = self.cfg["hidden_dim"]
 
+        # Stronger dropout on the added CS branch than on the base model.
+        # The CS branch is a residual on top of a competent baseline and
+        # is trained on a weak signal — it overfits easily if it gets the
+        # same dropout as the rest of the network.
+        cs_dropout = max(self.cfg["dropout"] * 2.0, 0.2)
+
         self.cs_block = CrossSectionBlock(
-            hid, self.cfg["num_heads"], self.cfg["dropout"]
+            hid, self.cfg["num_heads"], cs_dropout
         )
 
-        # Branch-specific projections before fusion.
-        self.reg_proj = nn.Linear(hid, hid)
+        # Gated residual fusion.  `cs_proj` maps the peer representation
+        # into the regime-branch space; `fuse_gate` is a content-aware
+        # sigmoid over `[reg_y, cs_y]` that decides how much of the peer
+        # signal to admit at each timestep.
         self.cs_proj = nn.Linear(hid, hid)
-        self.fuse_norm = nn.LayerNorm(hid)
+        self.fuse_gate = nn.Linear(2 * hid, hid)
 
-        # (a) identity-init on reg_proj so the regime signal flows
-        # through unchanged at step 0 — reproduces pure-XTrend behaviour
-        # when cs_proj starts near zero (see XTrendLL).
         with torch.no_grad():
-            nn.init.eye_(self.reg_proj.weight)
-            nn.init.zeros_(self.reg_proj.bias)
+            # cs_proj zero-init → enc_y == reg_y at step 0 regardless of gate.
+            nn.init.zeros_(self.cs_proj.weight)
+            nn.init.zeros_(self.cs_proj.bias)
+            # gate bias −2 → sigmoid(−2) ≈ 0.12, so even once cs_proj
+            # starts moving the gate stays mostly closed until it's
+            # explicitly opened.
+            nn.init.constant_(self.fuse_gate.bias, -2.0)
 
         # (b) dedicated peer encoder (shared embedding, otherwise
-        # independent of the target / key / value encoders).
+        # independent of the target / key / value encoders).  Boosted
+        # dropout matches the cs_block — both process the same peer
+        # sequences and benefit from the same anti-overfit pressure.
         self.peer_encoder = TemporalBlock(
             input_dim, hid, num_assets,
-            self.cfg["dropout"], self.emb,
+            cs_dropout, self.emb,
         )
+
+    def _fuse_branches(self, reg_y, cs_y):
+        """Gated residual: reg_y unchanged, cs branch sigmoid-gated."""
+        gate = torch.sigmoid(self.fuse_gate(torch.cat([reg_y, cs_y], dim=-1)))
+        return reg_y + gate * self.cs_proj(cs_y)
 
     def encode_peers(self, peer_x, peer_id):
         B, N, T, F = peer_x.shape
@@ -73,7 +94,7 @@ class XTrendCS(XTrend):
         if peer_x is not None and peer_id is not None:
             peer_h = self.encode_peers(peer_x, peer_id)               # [B, N, T, H]
             cs_y = self.cs_block(q, peer_h, peer_mask)                # [B, T, H]
-            enc_y = self.fuse_norm(self.reg_proj(reg_y) + self.cs_proj(cs_y))
+            enc_y = self._fuse_branches(reg_y, cs_y)
         else:
             enc_y = reg_y
 

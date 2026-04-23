@@ -6,11 +6,20 @@ Extends `XTrendCS` by replacing its synchronous `CrossSectionBlock` with
 `peer_h: [B, N, T, H]` by slicing it at past time offsets, so the batch
 schema and data pipeline stay unchanged.
 
-Bennett's static lead-lag adjacency S is optional.  Pass `S_matrix=A`
-(where A is produced by `lead_lag.build_lead_lag_matrix_cached` and
-re-ordered via `lead_lag.align_S_to_asset_ids`) together with
-`ll_cfg={"use_bennett": True, ...}` to turn it on (the A2 workflow).
-Leaving both defaults gives the A1 workflow (learnable τ only).
+Workflows supported (all controllable via `ll_cfg` + optional tensors):
+
+  * A1  — learnable τ only.  `ll_cfg={"use_bennett": False}`,
+          `S_matrix=None`, `rank_topk_mask=None`, `use_delta_value=False`.
+  * A2  — add 2D Bennett soft bias.  Pass `S_matrix: [N, N]` and set
+          `ll_cfg["use_bennett"]=True`.
+  * A2.5 — per-lag soft bias.  Same as A2 but pass `S_matrix: [L, N, N]`
+          (see `lead_lag.artifact_to_lag_strength_tensor`).
+  * A3  — A2.5 + hard top-K peer mask per lag.  Pass `rank_topk_mask:
+          [L, N, N]` and set `ll_cfg["use_rank_mask"]=True`.
+  * A4  — A3 + DeltaLag "Δ-value" V path.  Set
+          `ll_cfg["use_delta_value"]=True`.
+  * A5  — all three knobs on simultaneously (the full stack the user
+          runs in `xtrendll_a5_full_stack.ipynb`).
 """
 
 from __future__ import annotations
@@ -18,7 +27,6 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-import torch.nn as nn
 
 # `xtrendll` is self-contained: everything it depends on is a sibling
 # module inside the package (copied from the base repo during setup).
@@ -32,10 +40,12 @@ from .lag_blocks import LagAwarePeerBlock
 # adding xtrendll does not touch any existing module.
 # ────────────────────────────────────────────────────────────────────────────
 LL_DEFAULT = {
-    "lag_set":     (1, 5, 10, 21, 30),   # τ candidates, capped at 30 days
-    "top_k":       3,                    # keep best 3 (peer, lag) pairs per time step
-    "use_bennett": False,                # True → A2 workflow, adds Bennett prior
-    "alpha_init":  0.1,                  # scale of Bennett logit bias
+    "lag_set":         (1, 5, 10, 21, 30),  # τ candidates, capped at 30 days
+    "top_k":           3,                   # keep best 3 (peer, lag) pairs per time step
+    "use_bennett":     False,               # True → add Bennett prior (A2 / A2.5)
+    "alpha_init":      0.1,                 # scale of Bennett logit bias
+    "use_rank_mask":   False,               # True → apply hard top-K mask (A3)
+    "use_delta_value": False,               # True → V uses Δ = peer_h_now - peer_h_lag (A4)
 }
 
 
@@ -50,8 +60,9 @@ class XTrendLL(XTrendCS):
 
     Differences vs XTrendCS:
       * `self.cs_block` is a `LagAwarePeerBlock` instead of `CrossSectionBlock`.
-      * `self.cs_proj` is re-initialised near zero so the model starts as
-        vanilla X-Trend and "earns" the peer contribution during training.
+      * The gated-residual fusion from `XTrendCS` (zero-init `cs_proj`,
+        gate bias −2.0) already starts this model as vanilla X-Trend, so
+        no extra re-init is needed here.
     """
 
     def __init__(
@@ -61,6 +72,7 @@ class XTrendLL(XTrendCS):
         cfg=None,
         ll_cfg: Optional[dict] = None,
         S_matrix: Optional[torch.Tensor] = None,
+        rank_topk_mask: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__(input_dim, num_assets, cfg)
         hid = self.cfg["hidden_dim"]
@@ -71,24 +83,33 @@ class XTrendLL(XTrendCS):
             resolved.update(ll_cfg)
         self.ll_cfg = resolved
 
-        S_for_block = S_matrix if resolved.get("use_bennett", False) else None
+        # Only forward the matrices if the corresponding flag is on — lets
+        # the user pass both S and mask into every notebook and flip flags
+        # to ablate without re-loading artefacts.
+        S_for_block    = S_matrix      if resolved.get("use_bennett",   False) else None
+        M_for_block    = rank_topk_mask if resolved.get("use_rank_mask", False) else None
+        use_delta      = bool(resolved.get("use_delta_value", False))
+
+        # LL branch gets a stronger dropout than the rest of the model.
+        # Rationale in the plan: the lag-aware branch has N·L candidates
+        # worth of capacity and is trained on a weak Sharpe signal, so
+        # without extra regularisation it latches onto spurious peer
+        # correlations and degrades generalisation.  The base encoder /
+        # context branch keeps its normal dropout (cfg["dropout"]).
+        ll_dropout = max(self.cfg.get("dropout", 0.1) * 2.5, 0.25)
 
         # Replace parent's cs_block with our lag-aware version.
         self.cs_block = LagAwarePeerBlock(
             hid=hid,
             num_heads=self.cfg.get("num_heads", 4),
-            dropout=self.cfg.get("dropout", 0.1),
+            dropout=ll_dropout,
             lag_set=resolved["lag_set"],
             top_k=resolved["top_k"],
             S_matrix=S_for_block,
             alpha_init=resolved["alpha_init"],
+            rank_topk_mask=M_for_block,
+            use_delta_value=use_delta,
         )
-
-        # Near-zero init on the peer projection so the model starts ≈ XTrend
-        # and has to actively open the peer branch via gradient descent.
-        with torch.no_grad():
-            nn.init.normal_(self.cs_proj.weight, std=1e-3)
-            nn.init.zeros_(self.cs_proj.bias)
 
     # The only real difference in forward is that we pass target_id /
     # peer_id into cs_block for the optional Bennett lookup.
@@ -118,7 +139,7 @@ class XTrendLL(XTrendCS):
                 q, peer_h, peer_mask,
                 target_id=target_id, peer_id=peer_id,
             )                                                          # [B, T, H]
-            enc_y = self.fuse_norm(self.reg_proj(reg_y) + self.cs_proj(cs_y))
+            enc_y = self._fuse_branches(reg_y, cs_y)
         else:
             enc_y = reg_y
 

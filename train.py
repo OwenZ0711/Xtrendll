@@ -357,23 +357,30 @@ def fit(model, train_loader, val_loader, device,
           "val_mdd_net": vs["net_max_drawdown"],
           "val_turnover": vs["avg_turnover"],
           "lr": cur_lr,
+          "is_checkpoint_best": False,
       }
-      history.append(row)
-      print(
-          f"Ep {ep:03d} | trn {tl:.4f} | val {vs['loss']:.4f} | "
-          f"gross {vs['sharpe']:.4f} | net {vs['net_sharpe']:.4f} | "
-          f"to {vs['avg_turnover']:.4f} | lr {cur_lr:.2e}"
-      )
 
       if vs["net_sharpe"] > best_sharpe + 1e-4:
           best_sharpe = vs["net_sharpe"]
           best_state = copy.deepcopy(model.state_dict())
           wait = 0
+          row["is_checkpoint_best"] = True
+          early_stop = False
       else:
           wait += 1
-          if wait >= tcfg["patience"]:
-              print(f"Early stop at epoch {ep}")
-              break
+          early_stop = wait >= tcfg["patience"]
+
+      history.append(row)
+      print(
+          f"Ep {ep:03d} | trn {tl:.4f} | val {vs['loss']:.4f} | "
+          f"gross {vs['sharpe']:.4f} | net {vs['net_sharpe']:.4f} | "
+          f"to {vs['avg_turnover']:.4f} | lr {cur_lr:.2e}"
+          f"{'  ★ best' if row['is_checkpoint_best'] else ''}"
+      )
+
+      if early_stop:
+          print(f"Early stop at epoch {ep}")
+          break
 
     model.load_state_dict(best_state)
     return model, pd.DataFrame(history)

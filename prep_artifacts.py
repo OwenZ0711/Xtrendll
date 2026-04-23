@@ -42,7 +42,7 @@ import subprocess
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import pandas as pd
 
@@ -55,7 +55,7 @@ from .cpd import segment_panel_cached, build_regime_cache_cached
 # `xtrendll` package import) works without yfinance — Colab training
 # notebooks only need to *load* the pickled artefacts, not re-download
 # prices.
-from .lead_lag import build_lead_lag_matrix_cached
+from .lead_lag import build_lead_lag_matrix_cached, build_lag_ranking_cached
 
 
 # ─── universes ─────────────────────────────────────────────────────────────
@@ -115,6 +115,10 @@ def prep_all(
     cpd_jobs: int = 1,
     bennett: bool = False,
     bennett_max_lag: int = 5,
+    lag_rankings: bool = False,
+    lag_ranking_lags: Iterable[int] = (1, 5, 10, 21, 30),
+    lag_ranking_top_k: int = 5,
+    lag_ranking_min_obs: int = 252,
     recompute_every: Optional[int] = None,
     verbose: int = 1,
 ) -> Path:
@@ -209,6 +213,31 @@ def prep_all(
                   f"{lead_lag_payload['S'].shape} "
                   f"(elapsed {time.perf_counter() - t0:.1f}s)")
 
+    # 4b. Optional 3D per-lag rankings (A2.5 / A3 paths) -------------------
+    lag_ranking_payload = None
+    if lag_rankings:
+        if verbose:
+            print(
+                f"[prep] build_lag_ranking_cached "
+                f"(lags={tuple(lag_ranking_lags)}, top_k={lag_ranking_top_k}) ..."
+            )
+        t0 = time.perf_counter()
+        lag_ranking_payload = build_lag_ranking_cached(
+            train_panel, train_d, tk2id,
+            cache_dir=str(hidden_cache),
+            lags=lag_ranking_lags,
+            top_k=lag_ranking_top_k,
+            min_obs=lag_ranking_min_obs,
+            verbose=verbose,
+        )
+        if verbose:
+            n_tk = len(lag_ranking_payload["tickers"])
+            print(
+                f"[prep]   lag-ranking artefact: "
+                f"{len(lag_ranking_payload['lags'])} lags × {n_tk}×{n_tk} "
+                f"(elapsed {time.perf_counter() - t0:.1f}s)"
+            )
+
     # 5. Save tagged pretty copies -----------------------------------------
     panel_bundle = {
         "panel": panel,
@@ -231,6 +260,10 @@ def prep_all(
         paths["lead_lag_matrix"] = out / f"lead_lag_matrix__{tag}.pkl"
         _dump(lead_lag_payload, paths["lead_lag_matrix"])
 
+    if lag_ranking_payload is not None:
+        paths["lag_rankings"] = out / f"lag_rankings__{tag}.pkl"
+        _dump(lag_ranking_payload, paths["lag_rankings"])
+
     # 6. MANIFEST ----------------------------------------------------------
     manifest = {
         "tag": tag,
@@ -242,6 +275,10 @@ def prep_all(
         "recompute_every": recompute_every,
         "bennett": bool(bennett),
         "bennett_max_lag": int(bennett_max_lag) if bennett else None,
+        "lag_rankings": bool(lag_rankings),
+        "lag_ranking_lags": list(lag_ranking_lags) if lag_rankings else None,
+        "lag_ranking_top_k": int(lag_ranking_top_k) if lag_rankings else None,
+        "lag_ranking_min_obs": int(lag_ranking_min_obs) if lag_rankings else None,
         "n_assets_kept": len(tk2id),
         "feature_cols": list(fcols),
         "train_days": int(len(train_d)),
@@ -278,7 +315,8 @@ def load_artifacts(path: str, tag: Optional[str] = None, verbose: int = 1) -> di
       panel, fcols, tk2id, data_run              (from panel_bundle)
       train_regimes, val_regime_cache,
       test_regime_cache                          (CPD artefacts)
-      lead_lag_matrix (optional, A2 only)        (Bennett artefact)
+      lead_lag_matrix (optional, A2)             (2D Bennett artefact)
+      lag_rankings   (optional, A2.5 / A3)       (3D per-lag artefact)
       manifest                                   (parsed MANIFEST.json)
     """
     p = Path(path).resolve()
@@ -311,6 +349,9 @@ def load_artifacts(path: str, tag: Optional[str] = None, verbose: int = 1) -> di
     ll_path = p / f"lead_lag_matrix__{tag}.pkl"
     lead_lag_matrix = _load(ll_path) if ll_path.exists() else None
 
+    lag_rank_path = p / f"lag_rankings__{tag}.pkl"
+    lag_rankings = _load(lag_rank_path) if lag_rank_path.exists() else None
+
     # Restore panel date dtype defensively
     panel = panel_bundle["panel"].copy()
     panel["date"] = pd.to_datetime(panel["date"])
@@ -324,6 +365,12 @@ def load_artifacts(path: str, tag: Optional[str] = None, verbose: int = 1) -> di
               f"test snapshots={len(test_regime_cache)}")
         if lead_lag_matrix is not None:
             print(f"  lead_lag_matrix shape={lead_lag_matrix['S'].shape}")
+        if lag_rankings is not None:
+            print(
+                f"  lag_rankings: {len(lag_rankings['lags'])} lags × "
+                f"{len(lag_rankings['tickers'])}×{len(lag_rankings['tickers'])} "
+                f"top_k={lag_rankings['top_k']}"
+            )
 
     return {
         "tag": tag,
@@ -335,6 +382,7 @@ def load_artifacts(path: str, tag: Optional[str] = None, verbose: int = 1) -> di
         "val_regime_cache": val_regime_cache,
         "test_regime_cache": test_regime_cache,
         "lead_lag_matrix": lead_lag_matrix,
+        "lag_rankings": lag_rankings,
         "manifest": manifest,
     }
 
@@ -354,6 +402,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bennett", action="store_true",
                    help="Also build the Bennett lead-lag matrix (A2 workflow).")
     p.add_argument("--bennett-max-lag", type=int, default=5)
+    p.add_argument("--lag-rankings", action="store_true",
+                   help="Also build per-lag Bennett rankings (A2.5 / A3 paths).")
+    p.add_argument("--lag-ranking-lags", type=str, default="1,5,10,21,30",
+                   help="Comma-separated τ list for --lag-rankings.")
+    p.add_argument("--lag-ranking-top-k", type=int, default=5)
+    p.add_argument("--lag-ranking-min-obs", type=int, default=252)
     p.add_argument("--recompute-every", type=int, default=None)
     p.add_argument("--out", default="./artifacts")
     p.add_argument("--quiet", action="store_true")
@@ -368,6 +422,8 @@ def main(argv=None):
         n_tickers = len(UNIVERSES[args.universe])
         tag = f"v1_etf{n_tickers}_{args.start[:4]}_{args.end[:4]}"
 
+    lag_ranking_lags = tuple(int(x) for x in args.lag_ranking_lags.split(",") if x)
+
     prep_all(
         universe=args.universe,
         start=args.start,
@@ -377,6 +433,10 @@ def main(argv=None):
         cpd_jobs=int(args.cpd_jobs),
         bennett=bool(args.bennett),
         bennett_max_lag=int(args.bennett_max_lag),
+        lag_rankings=bool(args.lag_rankings),
+        lag_ranking_lags=lag_ranking_lags,
+        lag_ranking_top_k=int(args.lag_ranking_top_k),
+        lag_ranking_min_obs=int(args.lag_ranking_min_obs),
         recompute_every=args.recompute_every,
         verbose=0 if args.quiet else 1,
     )

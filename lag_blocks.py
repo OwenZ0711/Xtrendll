@@ -15,11 +15,23 @@ input contract.  It differs in two ways:
      pick a handful of specific leaders rather than averaging across all
      peers, and is the core of the DeltaLag design.
 
-Optionally, a pre-computed Bennett lead-lag matrix S ∈ R[N_assets×N_assets]
-can be passed in; the block adds  α · log(S[peer, target] + ε)  to the
-logits so a static prior biases the learned attention toward historically
-leading peers.  This path is active only when `S_matrix` is not None
-(A2 workflow).
+Optionally, a pre-computed Bennett lead-lag matrix S can be passed in.
+Two shapes are accepted:
+
+  * **2D** S ∈ R[N, N]  — A2 workflow.  Same soft bias at every lag:
+        logits[b, t, v, ℓ] += α · log S[v, u]
+
+  * **3D** S ∈ R[L, N, N] — A2.5 workflow.  Per-lag soft bias:
+        logits[b, t, v, ℓ] += α · log S[ℓ, v, u]
+
+A hard ranking mask  `rank_topk_mask ∈ {True, False}[L, N, N]`  (A3) can
+additionally restrict the attention to the top-K historically best
+leaders for each (target, lag); non-selected peers are forced to -inf
+before the top-K softmax.
+
+Finally, `use_delta_value=True` (A4) changes the V source from
+`peer_h_lag` to `peer_h_now − peer_h_lag`, matching DeltaLag's "what
+changed" value path.
 """
 
 from __future__ import annotations
@@ -56,6 +68,8 @@ class LagAwarePeerBlock(nn.Module):
         top_k: int = 3,
         S_matrix: Optional[torch.Tensor] = None,
         alpha_init: float = 0.1,
+        rank_topk_mask: Optional[torch.Tensor] = None,
+        use_delta_value: bool = False,
     ) -> None:
         super().__init__()
         self.hid = hid
@@ -88,11 +102,31 @@ class LagAwarePeerBlock(nn.Module):
             persistent=False,
         )
 
-        # Bennett static prior (optional)
+        # Bennett static prior (optional).  Accept either [N, N] or [L, N, N]
+        # and remember which we got — the forward path branches on `s_ndim`.
         if S_matrix is not None:
             S = torch.as_tensor(S_matrix, dtype=torch.float32)
-            if S.ndim != 2 or S.shape[0] != S.shape[1]:
-                raise ValueError(f"S_matrix must be square [N,N]; got {tuple(S.shape)}")
+            if S.ndim == 2:
+                if S.shape[0] != S.shape[1]:
+                    raise ValueError(
+                        f"2D S_matrix must be square [N,N]; got {tuple(S.shape)}"
+                    )
+                self.s_ndim = 2
+            elif S.ndim == 3:
+                if S.shape[0] != self.L:
+                    raise ValueError(
+                        f"3D S_matrix must have shape [L,N,N] with L={self.L}; "
+                        f"got {tuple(S.shape)}"
+                    )
+                if S.shape[1] != S.shape[2]:
+                    raise ValueError(
+                        f"3D S_matrix inner dims must be square [N,N]; got {tuple(S.shape)}"
+                    )
+                self.s_ndim = 3
+            else:
+                raise ValueError(
+                    f"S_matrix must be 2D [N,N] or 3D [L,N,N]; got ndim={S.ndim}"
+                )
             # Store log(S) once; adding ε avoids -inf on zero entries.
             self.register_buffer("log_S", torch.log(S.clamp_min(1e-6)))
             self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
@@ -101,6 +135,31 @@ class LagAwarePeerBlock(nn.Module):
             self.register_buffer("log_S", torch.zeros(0), persistent=False)
             self.register_parameter("alpha", None)
             self.use_bennett = False
+            self.s_ndim = 0
+
+        # Hard top-K peer mask per lag (A3).  True = peer is allowed to
+        # contribute; False forces that (peer, lag) logit to -inf before
+        # the top-K sparsification.
+        if rank_topk_mask is not None:
+            M = torch.as_tensor(rank_topk_mask, dtype=torch.bool)
+            if M.ndim != 3:
+                raise ValueError(
+                    f"rank_topk_mask must be [L,N,N]; got {tuple(M.shape)}"
+                )
+            if M.shape[0] != self.L or M.shape[1] != M.shape[2]:
+                raise ValueError(
+                    f"rank_topk_mask must have shape [L,N,N] with L={self.L}; "
+                    f"got {tuple(M.shape)}"
+                )
+            self.register_buffer("rank_topk_mask", M)
+            self.use_rank_mask = True
+        else:
+            self.register_buffer(
+                "rank_topk_mask", torch.zeros(0, dtype=torch.bool), persistent=False,
+            )
+            self.use_rank_mask = False
+
+        self.use_delta_value = bool(use_delta_value)
 
     # ──────────────────────────────────────────────────────────────────
     def forward(
@@ -140,19 +199,39 @@ class LagAwarePeerBlock(nn.Module):
         # ── 2. Q / K / V projections ────────────────────────────────
         Q = self.W_Q(target_h)                                    # [B, T, H]
         K = self.W_K(peer_h_lag)                                  # [B, T, N, L, H]
-        V = self.W_V(peer_h_lag)                                  # [B, T, N, L, H]
+
+        # A4 (optional): value source is the *change* between the present
+        # peer state and its τ-lagged version, matching DeltaLag's idea of
+        # attending to "what moved" in the leader.  `peer_h_now` broadcasts
+        # across the lag axis so subtraction is well-defined for every τ.
+        if self.use_delta_value:
+            peer_h_now = peer_h.unsqueeze(3).expand(-1, -1, -1, L, -1)  # [B,N,T,L,H]
+            peer_h_now = peer_h_now.permute(0, 2, 1, 3, 4).contiguous() # [B,T,N,L,H]
+            V_src = peer_h_now - peer_h_lag
+        else:
+            V_src = peer_h_lag
+        V = self.W_V(V_src)                                       # [B, T, N, L, H]
 
         # ── 3. scaled dot-product scores ────────────────────────────
         # logits[b, t, n, l] = <Q[b,t], K[b,t,n,l]> / sqrt(H)
         logits = torch.einsum("bth,btnlh->btnl", Q, K) / math.sqrt(H)
 
-        # ── 4. Bennett static prior (A2 path) ───────────────────────
+        # ── 4. Bennett static prior (A2 / A2.5 paths) ───────────────
         if self.use_bennett and target_id is not None and peer_id is not None:
-            # S[v, u] = "v leads u" strength → bias the score that peer v
-            # contributes when target is u.
             tgt_b = target_id.unsqueeze(1).expand(-1, N)          # [B, N]
-            s_bias = self.log_S[peer_id, tgt_b].to(dtype)         # [B, N]
-            logits = logits + self.alpha.to(dtype) * s_bias.unsqueeze(1).unsqueeze(-1)
+            if self.s_ndim == 2:
+                # A2: shared bias across all lags.
+                # log_S[v, u] → [B, N] → broadcast to [B, 1, N, 1].
+                s_bias = self.log_S[peer_id, tgt_b].to(dtype)     # [B, N]
+                logits = logits + self.alpha.to(dtype) * s_bias.unsqueeze(1).unsqueeze(-1)
+            else:
+                # A2.5: per-lag bias — gather the L slices and stack.
+                # log_S has shape [L, N, N].
+                prior = torch.stack(
+                    [self.log_S[l_idx][peer_id, tgt_b] for l_idx in range(L)],
+                    dim=-1,
+                ).to(dtype)                                       # [B, N, L]
+                logits = logits + self.alpha.to(dtype) * prior.unsqueeze(1)
 
         # ── 5. masks: causal (t - τ ≥ 0) and peer validity ─────────
         # valid_time has shape [L, T] → broadcast to [1, T, 1, L].
@@ -162,6 +241,15 @@ class LagAwarePeerBlock(nn.Module):
         if peer_mask is not None:
             mp = peer_mask.to(torch.bool).unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
             logits = logits.masked_fill(~mp, float("-inf"))
+
+        # ── 5b. A3 hard top-K peer mask (per lag) ───────────────────
+        if self.use_rank_mask and target_id is not None and peer_id is not None:
+            tgt_b = target_id.unsqueeze(1).expand(-1, N)          # [B, N]
+            rank_mask = torch.stack(
+                [self.rank_topk_mask[l_idx][peer_id, tgt_b] for l_idx in range(L)],
+                dim=-1,
+            )                                                     # [B, N, L]
+            logits = logits.masked_fill(~rank_mask.unsqueeze(1), float("-inf"))
 
         # ── 6. top-k sparsification + masked softmax ────────────────
         NL = N * L

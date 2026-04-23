@@ -25,10 +25,11 @@ caller.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import pickle
 from pathlib import Path
-from typing import List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -174,6 +175,252 @@ def build_lead_lag_matrix_cached(
     if verbose:
         print(f"Cached lead-lag matrix to {path}")
     return payload
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Per-lag ranking artefact (A2.5 / A3 paths)
+# ═════════════════════════════════════════════════════════════════════════
+#
+# Instead of collapsing the lag axis into a single [N, N] matrix (as
+# `build_lead_lag_matrix` does), this section produces a [L, N, N] stack
+# of per-lag signed correlations, a per-lag "strength" score, and a
+# per-lag top-K peer mask.  Matches the schema used in the parent-dir
+# `lead_lag_ranking.py` so notebooks can load either artefact.
+#
+# Strength = log1p(|t-stat(rho, n_obs)|), a monotone transform of
+# signed Pearson correlation that rewards statistical significance.
+#
+# Indexing convention: matrices are [peer_id, target_id] — rows say who
+# leads, columns say who is led.  The LagAwarePeerBlock then does
+#     logits[b, t, v, ℓ] += α · log_strength[ℓ, v, u]
+# with v = peer_id, u = target_id.
+
+
+def _corr_to_strength(rho: float, n_obs: int, eps: float = 1e-12) -> float:
+    """Signed Pearson → log1p(|t-stat|).
+
+    Stays 0 for rho=0 or degenerate pairs; grows roughly linearly in |rho|
+    and in sqrt(n_obs).  log1p keeps the scale compressed so a handful of
+    outliers do not swamp the ranking.
+    """
+    if not np.isfinite(rho):
+        return 0.0
+    denom = max(1.0 - float(rho) ** 2, eps)
+    t_abs = abs(float(rho)) * math.sqrt(max(n_obs - 2, 1) / denom)
+    return float(math.log1p(t_abs))
+
+
+def build_lag_ranking_artifact(
+    panel: pd.DataFrame,
+    train_d,
+    tk2id: dict,
+    lags: Iterable[int] = (1, 5, 10, 21, 30),
+    top_k: int = 5,
+    min_obs: int = 252,
+    progress: bool = True,
+) -> dict:
+    """
+    Train-only, per-lag peer ranking from `panel["target_return"]`.
+
+    Parameters
+    ----------
+    panel     : long panel with columns at least {"date", "ticker", "target_return"}
+    train_d   : an iterable of datetimes that defines the training window
+                (typically `train_d` from `data.time_split`).  Only rows with
+                dates in this set are used to fit the rankings — prevents
+                look-ahead.
+    tk2id     : {ticker: asset_id} mapping; the output is indexed in asset_id
+                order so `strength[ℓ][v, u]` maps directly to model indices.
+    lags      : candidate τ values.  Must match the `lag_set` you'll pass to
+                `XTrendLL` so `lag_order` alignment in the notebook works.
+    top_k     : number of peers kept per (target, lag) in the hard mask (A3).
+    min_obs   : minimum overlapping finite observations required to compute a
+                correlation.  Pairs below this threshold get strength 0 and
+                fall out of the top-K.
+
+    Returns a dict with keys matching the parent-dir `lead_lag_ranking.py`:
+        lags, tickers, tk2id, top_k, min_obs, score_name,
+        signed_corr : {lag: [N, N] float32},
+        strength    : {lag: [N, N] float32}   (≥ 0, 0 on diagonal),
+        topk_mask   : {lag: [N, N] bool}      (True for the K leaders per target),
+        topk_lists  : {lag: {target_ticker: [peer_tickers...]}}  (human-readable),
+        obs_count   : {lag: [N, N] int32}.
+    """
+    lags = tuple(int(l) for l in lags)
+    if any(l < 1 for l in lags):
+        raise ValueError("lags must all be >= 1")
+
+    # tickers in asset_id order
+    tickers = [tk for tk, _ in sorted(tk2id.items(), key=lambda kv: kv[1])]
+    n = len(tickers)
+
+    if "target_return" not in panel.columns:
+        raise KeyError(
+            "build_lag_ranking_artifact needs panel['target_return']; "
+            "make sure you are passing the post-`build_panel` DataFrame."
+        )
+
+    ret = (
+        panel.pivot(index="date", columns="ticker", values="target_return")
+        .reindex(columns=tickers)
+        .sort_index()
+    )
+    train_index = pd.DatetimeIndex(pd.to_datetime(list(train_d)))
+    ret_train = ret.loc[ret.index.intersection(train_index)].copy()
+    if ret_train.empty:
+        raise ValueError("No training-date rows after pivoting panel target_return.")
+
+    signed_corr: dict = {}
+    strength: dict = {}
+    topk_mask: dict = {}
+    topk_lists: dict = {}
+    obs_count: dict = {}
+
+    lag_iter = tqdm(lags, desc="lag-rankings", leave=False) if progress else lags
+    for lag in lag_iter:
+        corr_mat = np.zeros((n, n), dtype=np.float32)
+        strength_mat = np.zeros((n, n), dtype=np.float32)
+        obs_mat = np.zeros((n, n), dtype=np.int32)
+
+        for peer_id, peer_tk in enumerate(tickers):
+            x = ret_train[peer_tk].shift(lag).to_numpy()
+            for target_id, target_tk in enumerate(tickers):
+                if peer_id == target_id:
+                    continue
+                y = ret_train[target_tk].to_numpy()
+                mask = np.isfinite(x) & np.isfinite(y)
+                n_obs = int(mask.sum())
+                obs_mat[peer_id, target_id] = n_obs
+                if n_obs < min_obs:
+                    continue
+                rho = np.corrcoef(x[mask], y[mask])[0, 1]
+                if not np.isfinite(rho):
+                    continue
+                corr_mat[peer_id, target_id] = float(rho)
+                strength_mat[peer_id, target_id] = _corr_to_strength(rho, n_obs)
+
+        mask_mat = np.zeros((n, n), dtype=bool)
+        topk_for_lag: dict = {}
+        for target_id, target_tk in enumerate(tickers):
+            order = np.argsort(-strength_mat[:, target_id])
+            keep: list = []
+            for peer_id in order:
+                if peer_id == target_id:
+                    continue
+                if strength_mat[peer_id, target_id] <= 0:
+                    continue
+                keep.append(int(peer_id))
+                if len(keep) >= top_k:
+                    break
+            if keep:
+                mask_mat[keep, target_id] = True
+            topk_for_lag[target_tk] = [tickers[i] for i in keep]
+
+        signed_corr[lag] = corr_mat
+        strength[lag] = strength_mat
+        topk_mask[lag] = mask_mat
+        topk_lists[lag] = topk_for_lag
+        obs_count[lag] = obs_mat
+
+    return {
+        "lags":        lags,
+        "tickers":     tickers,
+        "tk2id":       dict(tk2id),
+        "top_k":       int(top_k),
+        "min_obs":     int(min_obs),
+        "score_name":  "target_return_lag_tstat_log1p_v1",
+        "signed_corr": signed_corr,
+        "strength":    strength,
+        "topk_mask":   topk_mask,
+        "topk_lists":  topk_lists,
+        "obs_count":   obs_count,
+    }
+
+
+def _lag_ranking_cache_key(
+    panel: pd.DataFrame, lags: Tuple[int, ...], top_k: int,
+    min_obs: int, train_d, algo_version: str,
+) -> str:
+    digest = pd.util.hash_pandas_object(
+        panel[["ticker", "date", "target_return"]], index=False
+    ).values.tobytes()
+    td_hash = hashlib.md5(
+        pd.to_datetime(pd.Index(train_d)).astype("int64").values.tobytes()
+    ).hexdigest()[:8]
+    payload = (
+        digest
+        + f"lag_rank:{algo_version}:{'_'.join(map(str, lags))}:".encode()
+        + f"k={top_k}:min_obs={min_obs}:td={td_hash}".encode()
+    )
+    return hashlib.md5(payload).hexdigest()[:16]
+
+
+def build_lag_ranking_cached(
+    panel: pd.DataFrame,
+    train_d,
+    tk2id: dict,
+    cache_dir=None,
+    lags: Iterable[int] = (1, 5, 10, 21, 30),
+    top_k: int = 5,
+    min_obs: int = 252,
+    algo_version: str = "v1",
+    verbose: int = 1,
+    progress: bool = True,
+) -> dict:
+    """Cached wrapper around `build_lag_ranking_artifact`."""
+    root = _cache_dir(cache_dir)
+    lags_t = tuple(int(l) for l in lags)
+    key = _lag_ranking_cache_key(panel, lags_t, int(top_k), int(min_obs), train_d, algo_version)
+    path = root / f"lag_rankings_{key}.pkl"
+
+    if path.exists():
+        if verbose:
+            print(f"Loading cached lag-ranking artefact from {path}")
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    if verbose:
+        print(f"Building lag-ranking artefact (lags={lags_t}, top_k={top_k}) ...")
+    artefact = build_lag_ranking_artifact(
+        panel, train_d, tk2id, lags=lags_t, top_k=int(top_k),
+        min_obs=int(min_obs), progress=progress,
+    )
+    with open(path, "wb") as f:
+        pickle.dump(artefact, f)
+    if verbose:
+        print(f"Cached lag-ranking artefact to {path}")
+    return artefact
+
+
+def artifact_to_lag_strength_tensor(
+    artifact: dict, lag_order: Iterable[int],
+) -> "np.ndarray":
+    """Stack `artifact["strength"]` dict into a [L, N, N] float array in the
+    order given by `lag_order`.  Returns numpy so the caller can
+    `torch.from_numpy(...)` or keep on CPU.
+    """
+    lag_order = tuple(int(l) for l in lag_order)
+    missing = [l for l in lag_order if l not in artifact["strength"]]
+    if missing:
+        raise KeyError(
+            f"lag_order contains lags not present in artefact: {missing}. "
+            f"Artefact lags = {artifact['lags']}."
+        )
+    return np.stack([artifact["strength"][l] for l in lag_order], axis=0).astype(np.float32)
+
+
+def artifact_to_lag_topk_mask_tensor(
+    artifact: dict, lag_order: Iterable[int],
+) -> "np.ndarray":
+    """Stack `artifact["topk_mask"]` dict into a [L, N, N] bool array."""
+    lag_order = tuple(int(l) for l in lag_order)
+    missing = [l for l in lag_order if l not in artifact["topk_mask"]]
+    if missing:
+        raise KeyError(
+            f"lag_order contains lags not present in artefact: {missing}. "
+            f"Artefact lags = {artifact['lags']}."
+        )
+    return np.stack([artifact["topk_mask"][l] for l in lag_order], axis=0).astype(bool)
 
 
 # ─── helper for the model: map tk_order → tensor indexed by asset_id ──────
